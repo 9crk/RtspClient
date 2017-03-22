@@ -22,17 +22,20 @@
 #include <arpa/inet.h> 
 
 #define OUR_DEV
+//#define HOME
 typedef void * HANDLE;
 #ifdef OUR_DEV
-#define DEF_RTSP_URL "rtsp://192.168.2.101/test10.264"
+#define URL			"192.168.0.28"
+// #define DEF_RTSP_URL "rtsp://192.168.1.95/264.264"
+// #define DEF_RTSP_URL "rtsp://192.168.0.28/trackID1"
+// #define DEF_RTSP_URL "rtsp://192.168.2.112/264.264"
 #else
 #define DEF_RTSP_URL "rtsp://192.168.0.29/"
 #endif
 
 #define RTSP_PORT 554
 #define PRG_NAME	"main"
-#define UDP_RECV_PORT0 	1023
-#define UDP_RECV_PORT1 	1024
+#define max( a, b ) ( a > b ? a : b )
 
 typedef enum RTSP_STAT
 {
@@ -64,29 +67,28 @@ typedef enum TRANSPORT
 typedef struct tagRtspClient
 {
 	unsigned int magic;
-	int fd; 	//  rtsp web socket
+	int fd; 	//rtsp web socket
 	TRANSPORT_E stream_type;	// 码流方式
 	int recv_fd[2]; //
-	int recv_port[2]; // 监听端口
-	char rtsp_url[128];
-	char session[20];
-	char track_addr[128]; 
-	char authName[64];
+	int recv_port[2]; // 本地UDP监听端口
+	char rtsp_url[128]; // rtsp request url
+	char server_ip[16];
+	int server_port[2];	// server 监听的端口
+	char session[20];	// 本次会话的session
+	char authName[64];	// 需要登录的用户名和密码
 	char authPwd[64];
-	int support_cmd;
+	int support_cmd;	// 支持命令的列表，暂时不用
 	int bQuit;
-	int trackId;
-	time_t tou;
-	RTPS_STAT_E stat;
-	LINK_STAT_E link;
-	int CSeq;
-	void *recv_buf;
-	int maxBufSize;
-	HANDLE *Filter;
-	HANDLE *Vdec;
+	time_t tou;			// 用于发送心跳包
+	RTPS_STAT_E stat;	// 当前发包状态
+	LINK_STAT_E link;	// 当前连线状态
+	int CSeq;			// 当前发送命令序列号
+	void *recv_buf;		// udp消息接收包
+	int maxBufSize;		// UDP消息报最大值
+	HANDLE *Filter;		// 用于转发消息
+	HANDLE *Vdec;		// 解码库指针
 //	struct list_head list;
 }RtspClient, *PVHRtspClient;
-
 
 #define SOCK_ERROR() do{\
 	if( len <= 0 )\
@@ -98,7 +100,6 @@ typedef struct tagRtspClient
 }while(0)
 
 /*  TCP and UDP API*/
-
 int sock_listen( int port, const char *ipbind, int backlog )
 {
 	struct sockaddr_in 	my_addr;
@@ -125,7 +126,6 @@ int sock_listen( int port, const char *ipbind, int backlog )
 			return fd;
 		}
 	}
-
 	close(fd);
 	return -1;
 }
@@ -176,11 +176,32 @@ int sock_udp_bind( int port )
 
 		if (bind ( udp_fd, (struct sockaddr *) &my_addr, sizeof (my_addr)) < 0)
 		{
-    	close( udp_fd );
-    	udp_fd = -EIO;
-  	}
+    		close( udp_fd );
+    		udp_fd = -EIO;
+  		}
 	}
   return udp_fd;
+}
+	
+int sock_udp_send( const char *ip, int port, const void* msg, int len )
+{
+	// SOCKADDR_IN	udp_addr;
+	struct sockaddr_in 	udp_addr;
+	int	sockfd, ret;
+
+	sockfd = socket( AF_INET, SOCK_DGRAM, 0 );
+	if( sockfd <= 0 ) return -1;
+
+  //setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &tmp, sizeof(tmp));
+
+	memset( & udp_addr, 0, sizeof(udp_addr) );
+	udp_addr.sin_family = AF_INET;
+	inet_aton( ip, &udp_addr.sin_addr );
+	udp_addr.sin_port = htons( (short)port );
+
+	ret = sendto( sockfd, msg, len, 0, (const struct sockaddr *) & udp_addr, sizeof(udp_addr) );
+	close( sockfd );
+	return ret;
 }
 
 static sock_read( int fd , char *buf, int maxBuf )
@@ -449,10 +470,7 @@ int strgetword( const char *string, char *buf, int size, char **pleft)
 	}
 	return 0;
 }
-
-
-
-/* TCP and UDP API */
+/* TCP and UDP API EDN  */
 
 static const char *read_line( char *buf, char *line, char **dptr )
 {
@@ -574,9 +592,6 @@ static void AnsOption( HANDLE handle, char *buf )
 				 break;
 		}
 	}
-
-
-	printf("Let's go to next get descript!\r\n" );
 	obj->stat = RTSP_DESCRIPT;	
 }
 
@@ -585,7 +600,8 @@ static void AnsDescript( HANDLE handle, char *buf )
 	PVHRtspClient obj = (PVHRtspClient)handle;
 	if( IsAnsOK( buf ) != 0 )
 		return;
-	char *ptr = NULL;
+	char *ptr , *q;
+	char tmp[128];
 	ptr = strstr( buf, "\r\n\r\n" );
 	if( ptr )
 	{
@@ -593,7 +609,35 @@ static void AnsDescript( HANDLE handle, char *buf )
 		if( *ptr == '\0' )
 			return;
 	}
-	printf("Let's go to next get setup!\r\n" );
+	// 获取Descript中关于Track的内容，由于Reply的Content里会有a=control:*部分，这部分我们不用，直接跳过，获取第一个track部分
+	//定位到视频部分 音频部分为 m=audio
+    ptr = strstr( buf, "m=video" );
+    if( ptr )
+    {   
+		ptr = strstr( ptr, "a=control" );
+		if( ptr )
+		{
+			for( ;*ptr != ':'; ptr++ );
+			ptr++;
+			q = tmp;
+			while( *ptr != '\r' && *ptr != ';' && *ptr != '\t' && *ptr != '\n' )
+				if( *ptr != ' ' )
+					*q++ = *ptr++;
+			else
+				ptr++;
+			*q = '\0';
+			//我们只取第一个RTSP内容
+			sprintf( obj->rtsp_url, "rtsp://%s/%s", obj->server_ip, tmp );
+			printf("rtsp_url ip:%s \r\n", obj->rtsp_url );
+		}else{
+			printf("can not find the rtsp source");
+			obj->stat = RTSP_OPTION;
+		}
+	}else
+	{
+		printf("can not find the rtsp source");
+		obj->stat = RTSP_OPTION;
+	}
 	obj->stat = RTSP_SETUP;	
 }
 
@@ -602,17 +646,43 @@ static void AnsSetup( HANDLE handle, char *buf )
 	PVHRtspClient obj = (PVHRtspClient)handle;
 	if( IsAnsOK( buf ) != 0 )
 		return;
-	char session[128];
+	char tmp[128];
 	char *ptr, *q;
-	q = session;
-	ptr = strstr( buf, "Session" );
+	ptr = strstr( buf, "server_port=" );
 	if( ptr )
 	{
+		ptr += 12;
+		q = tmp;
 		while( *ptr != '\r' && *ptr != ';' && *ptr != '\t' && *ptr != '\n')
-			*q++ = *ptr++;
+			if( *ptr != ' ' )
+				*q++ = *ptr++;
+		else
+			ptr++;
 		*q = '\0';
-		strcpy( obj->session, session + 9 );
-		printf("========>>>>>>> Get Sesson:%s \r\n", obj->session );
+		int start, end;
+		sscanf( tmp, "%d-%d", &start, &end );
+		obj->server_port[0] = start;
+		obj->server_port[1] = end;
+		printf("Server listen port:%d - %d\r\n", start, end );
+	}
+	ptr = strstr( buf, "Session:" );
+	if( ptr )
+	{
+		q = tmp;
+		ptr += 8;
+		while( *ptr != '\r' && *ptr != ';' && *ptr != '\t' && *ptr != '\n')
+		{
+			if( *ptr != ' ' )
+				*q++ = *ptr++;
+			else
+				ptr++;
+		}
+		printf("Session:%s \r\n", tmp );
+		*q = '\0';
+		strcpy( obj->session, tmp );
+	}else{
+		printf("Not find ptr!\r\n");
+		obj->stat = RTSP_OPTION;	
 	}
 	obj->stat = RTSP_PLAY;	
 }
@@ -623,6 +693,7 @@ static void AnsPlay( HANDLE handle, char *buf )
 	if( IsAnsOK( buf ) != 0 )
 		return;
 	char *ptr = NULL;
+	obj->stat = RTSP_KEEP;	
 	ptr = strstr( buf, "\r\n\r\n" );
 	if( ptr )
 	{
@@ -630,9 +701,9 @@ static void AnsPlay( HANDLE handle, char *buf )
 		if( *ptr == '\0' )
 			return;
 	}
-	obj->stat = RTSP_KEEP;	
 }
 
+// 该接口没用过，等到以后需要使用的时候再说，也不知道该接口干嘛的
 static void AnsGetParam( HANDLE handle, char *buf )
 {
 	PVHRtspClient obj = (PVHRtspClient)handle;
@@ -650,6 +721,7 @@ static void AnsGetParam( HANDLE handle, char *buf )
 	obj->stat = RTSP_KEEP;	
 }
 
+//  关闭数据流
 static void AnsStop( HANDLE handle, char *buf )
 {
 	if( IsAnsOK( buf ) != 0 )
@@ -680,7 +752,7 @@ static const char *getAuthurationInfo( HANDLE handle )
 	char const* const authFmt = "Authorization: Basic %s\r\n";
 	unsigned usernamePasswordLength = strlen(obj->authName) + 1 + strlen(obj->authPwd);
 	sprintf(body, "%s:%s", obj->authName, obj->authPwd);
-	int len = str_b64enc(body, enBody, sizeof( enBody ));
+//	int len = str_b64enc(body, enBody, sizeof( enBody ));
 //	unsigned const authBufSize = strlen(authFmt) + strlen(enBody) + 1;
 	sprintf(authon, authFmt, enBody );
 	return authon;
@@ -690,7 +762,10 @@ int SendRequest( HANDLE handle , RTPS_STAT_E type )
 {
 	PVHRtspClient obj = (PVHRtspClient)handle;
 	char *cmd = NULL;
-	int CSeq = obj->CSeq++;
+	if( type == RTSP_NONE )
+		obj->CSeq = 0;
+	if( type != RTSP_PLAY )
+		obj->CSeq++;
 	char Agent[128] = {0}, StrCSeq[30] = {0}, Authoration[128] = {0};
 	char contentLengthHeader[128] = {0}, extraHeaders[128] = {0};
 	char contentStr[512] = {0};
@@ -701,7 +776,7 @@ int SendRequest( HANDLE handle , RTPS_STAT_E type )
 	"%s"	// Authuration
 	"%s"	// Agent 
 	"%s"	// extraHeader
-	"%s"	//  contentlen
+	"%s"	// contentlen
 	"\r\n"
 	"%s"; // content
 	switch( type )
@@ -733,7 +808,7 @@ int SendRequest( HANDLE handle , RTPS_STAT_E type )
 	break;
 	}
 	sprintf( Agent, "User-Agent: %s\r\n",  PRG_NAME );
-	sprintf( StrCSeq, "CSeq: %d\r\n", CSeq );
+	sprintf( StrCSeq, "CSeq: %d\r\n", obj->CSeq );
 	if( obj->session[0] != '\0' &&  obj->stat >  RTSP_SETUP )
 		sprintf( extraHeaders, "Session: %s\r\nRange: npt=0.000-\r\n", obj->session );
 	else  
@@ -757,7 +832,7 @@ int SendRequest( HANDLE handle , RTPS_STAT_E type )
 	}	
 	if( sock_dataready(obj->fd, 2000) )
 	{
-		// if we have receive data
+		memset( obj->recv_buf, 0, obj->maxBufSize );
 		if( 0 >=  read( obj->fd, obj->recv_buf, obj->maxBufSize ) )
 		{
 			printf("No response!\r\n");
@@ -817,23 +892,21 @@ const char *show_hex( const char *ch, int rlen)
 
 void RTCP_PackParse( PVHRtspClient client , char *buf, int size )
 {
-
+	memset( buf, 0, size );
+	int len = create_rtcp_reportinfo( buf, sizeof( buf ));
+	// RTCP 包就回复一下就好了， 无所谓的，基本不用的
+	sock_udp_send( client->server_ip, client->server_port[1], buf, len );
+	//	printf("==================>>>>>>>>> Receive RTCP Rackage %s !\r\n", show_hex( buf, len ));
 }
-
 
 void RTP_PackParse( PVHRtspClient client , char *buf, int size )
 {
-	// 解析码流数据，存放到解码通道
-//	Hi264DecFrame( client->Vdec, buf + 36, size - 36 );	
 	if( ParseRtp( buf, size ) == 1 )
 	{
-		SaveAs();
+		// 如果获取到足够发送的码流，就发送出去
+		RTP_Send( client->Vdec );
 	}
-
-#if 0	
-	if( size > 36 )
-		FilterWrite( client->Filter, buf + 36, size - 36 );
-#endif
+//		FilterWrite( client->Filter, buf + 36, size - 36 );
 }
 
 void *rtsp_work_thread(void *args)
@@ -842,6 +915,9 @@ void *rtsp_work_thread(void *args)
 	obj->link = LINK_CONNECTING;
 	int len;	
 	int fd;
+	time_t tout;
+	// 先创建访问RTSP的OPTION部分内容
+	sprintf( obj->rtsp_url, "rtsp://%s/", obj->server_ip );
 	while( !obj->bQuit )
 	{
 		if( obj->link != LINK_CONNECTED )
@@ -849,11 +925,7 @@ void *rtsp_work_thread(void *args)
 		obj->stat = RTSP_NONE;
 		if(obj->link != LINK_CONNECTED && obj->stat == RTSP_NONE )
 		{
-#ifdef OUR_DEV
-			fd = sock_connect( "192.168.2.101", 554 );
-#else
-			fd = sock_connect( "192.168.0.29", 554 );
-#endif
+			fd = sock_connect( obj->server_ip, 554 );
 			if( fd < 0 )
 			{
 				printf("connect failed! %s \r\n", strerror( errno ));
@@ -868,7 +940,6 @@ void *rtsp_work_thread(void *args)
 		obj->fd = fd;
 		if( SendRequest(obj, RTSP_OPTION ) == 0 )
 		{
-			
 			printf("====> option OK!\r\n");
 		}else
 			continue;
@@ -886,41 +957,58 @@ void *rtsp_work_thread(void *args)
 			continue;
 		if( SendRequest(obj, RTSP_PLAY ) == 0 )
 		{
+			printf("Play OK!\r\n");
+			obj->stat = RTSP_KEEP;
 			obj->tou = time(NULL) + 60;
 		}else
+		{
+			printf("Play Error!\r\n");
 			continue;
-		
+		}
+		tout = time( NULL );	
 		while( obj->stat == RTSP_KEEP )
 		{
-			if( obj->tou < time(NULL) )
+			// 如果一直连接，则接收码流数据，如果5秒还没收到码流数据,或者1分钟超时，就发送一次心跳包，就发个OPTION帧好了
+			if( obj->tou < time(NULL) || ( tout + 5 ) < time( NULL )  )
 			{
-				if( SendRequest(obj, RTSP_PLAY ) == 0 )
+				if( SendRequest(obj, RTSP_OPTION ) == 0 )
 				{	
+					obj->stat = RTSP_KEEP;
 					// each 60s should be reconnect to rtsp send play as the heartbeat
 					obj->tou = time(NULL) + 60;
+					tout = time( NULL );
 				}else{
-					printf("===>>> Send Play Error!\r\n");
+					printf("has already disconnect!\r\n");
 					obj->stat = RTSP_NONE;
 				}
 			}
 			if( obj->stream_type == TRANS_TCP )
 			{
 				// tcp方式的话直接解析就好了，已经包含了RTP包了
-				
+				// not supprt now!
 			}else if( obj->stream_type == TRANS_UDP )
 			{	
-				// 如果是UDP方式，则直接接收码流存放到解码通道		
-				if( sock_dataready( obj->recv_fd[1] , 20) )
+				int maxFd = max( obj->recv_fd[0], obj->recv_fd[1] );
+				struct	timeval tv;
+				fd_set rfd_set;
+				int	nsel;
+				FD_ZERO( &rfd_set );
+				FD_SET( obj->recv_fd[0], &rfd_set );
+				FD_SET( obj->recv_fd[1], &rfd_set );
+				tv.tv_sec = 0;
+				tv.tv_usec = 10 * 1000;
+				nsel = select( maxFd + 1, &rfd_set, NULL, NULL, &tv );
+				if ( nsel > 0 && FD_ISSET( obj->recv_fd[1], &rfd_set ) )
 				{
 					len = sock_read( obj->recv_fd[1], obj->recv_buf, obj->maxBufSize );
 					if( len > 4 )
 						RTCP_PackParse( obj, obj->recv_buf, len );
-				}
-				if( sock_dataready( obj->recv_fd[0], 20) )
+				}else if( nsel > 0 && FD_ISSET( obj->recv_fd[0], &rfd_set ))
 				{
 					len = sock_read( obj->recv_fd[0], obj->recv_buf, obj->maxBufSize );
 					if( len > 4 )
 						RTP_PackParse( obj, obj->recv_buf, len );
+					tout = time( NULL );
 				}
 			}
 		}
@@ -928,35 +1016,24 @@ void *rtsp_work_thread(void *args)
 	close( obj->fd );
 }
 
-void receive_udp()
+// 主码流次码流？现在不支持选择，只是放这边好了
+HANDLE RTSP_New( const char *server_ip , int maj , char *usrname, char *passwd)
 {
-
-	int fd0 = sock_udp_bind( UDP_RECV_PORT0 );
-	int fd1 = sock_udp_bind( UDP_RECV_PORT1 );
-	printf("Fd:%d Fd:%d \r\n", fd0, fd1 );
-	int len;
-	char recv_buf[4096];
-	int maxBufSize = 4096;
-	while( 1 )
-	{
-			if( sock_dataready( fd0 , 200) )
-			{
-				len = sock_read( fd0, recv_buf, maxBufSize );
-				RTCP_PackParse( NULL, recv_buf, len );
-				printf("udp has data incomming!:%d \r\n", len );
-			}
-				if( sock_dataready( fd1, 200) )
-			{
-				len = sock_read( fd1, recv_buf, maxBufSize );
-				RTP_PackParse( NULL, recv_buf, len );
-				printf("udp has data incomming!:%d \r\n", len );
-			}
-	}
+	RtspClient	*client = malloc( sizeof( RtspClient ) );
+	memset( client, 0, sizeof( RtspClient ));
+	strcpy( client->server_ip, URL );
+	client->maxBufSize = 512*1024;		// 512k
+	client->recv_buf = malloc(client->maxBufSize);
+	if( usrname )
+		strcpy( client->authName, usrname );
+	if( passwd )
+		strcpy( client->authPwd, usrname );
+	return client;
 }
 
-#define URL
 int main(int argc, char *argv[])
 {
+#if 0
 	RTP_Init();
 	RtspClient	*client = malloc( sizeof( RtspClient ));
 	memset( client, 0, sizeof( RtspClient ));
@@ -969,31 +1046,27 @@ int main(int argc, char *argv[])
 		return;
 	}
 	rtsp_work_thread( (void *)client );
+#endif
 
-
-
-
-#if 0
+#if 1
+	// 使用RTSP形式发送数据
 	RTP_Init();
-	if( argc == 2 )
-	{
-		receive_udp();
-		return;
-	}
-
 	HISystem_Start();
-	HANDLE *vdec = Hi264DecCreate();
+	HANDLE *vdec = Hi264DecCreate( NULL );
 	if( vdec == NULL )
 	{
 		printf("create vdec error!\r\n");
 		return;
 	}
 	Hi264Init( vdec );
-	RtspClient	*client = malloc( sizeof( RtspClient ));
-	memset( client, 0, sizeof( RtspClient ));
-	strcpy( client->rtsp_url,  DEF_RTSP_URL );
-	client->maxBufSize = 1024*1024;
-	client->recv_buf = malloc(client->maxBufSize);
+	RtspClient *client;
+	if( argc == 2 )
+		client = RTSP_New( argv[1], 0, NULL, NULL );
+	else
+		client = RTSP_New( URL, 0, NULL, NULL );
+	
+		
+		
 	client->Vdec = vdec;
 	if( !client->recv_buf )
 	{
@@ -1001,32 +1074,44 @@ int main(int argc, char *argv[])
 		return;
 	}
 	rtsp_work_thread( (void *)client );
+#endif
 
+#if 0
+	//  直接获取码流数据
+	HISystem_Start();
+	HANDLE *vdec = Hi264DecCreate( NULL );
+	if( vdec == NULL )
+	{
+		printf("create vdec error!\r\n");
+		return;
+	}
+	Hi264Init( vdec );
+	H264DEC_Init( "192.168.1.92", 0, vdec );
+	while( 1 )
+		usleep( 10000 );
+#endif
+
+#if 0
+	// 使用TCP数据流
+	HISystem_Start();
 	FilterInit();
+	HANDLE *vdec = Hi264DecCreate( NULL );
+	if( vdec == NULL )
+	{
+		printf("create vdec error!\r\n");
+		return;
+	}
+	Hi264Init( vdec );
 	HANDLE *nf = NewFilter( 1024*1024 , vdec );
 	if( nf == NULL )
 	{
 		printf("create Filter error!\r\n");
 		return;
 	}
-	RtspClient	*client = malloc( sizeof( RtspClient ));
-	memset( client, 0, sizeof( RtspClient ));
-	strcpy( client->rtsp_url,  DEF_RTSP_URL );
-	client->maxBufSize = 1024*1024;
-	client->recv_buf = malloc(client->maxBufSize);
-	client->Filter = nf;
-	client->Vdec = vdec;
-	if( !client->recv_buf )
-	{
-		printf("malloc error!\r\n");
-		return;
-	}
-	rtsp_work_thread( (void *)client );
-#else
-#if 0
-	 H264DEC_Init( "192.168.1.92", 0, 0);
-	 while( 1 )
-		 usleep( 10000 );
+	H264DEC_Init( "192.168.1.92", 0 , nf);
+	while( 1 )
+		usleep( 10000 );
+
 #endif
-#endif
+
 }
