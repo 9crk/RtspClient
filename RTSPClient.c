@@ -1033,85 +1033,15 @@ HANDLE RTSP_New( const char *server_ip , int maj , char *usrname, char *passwd)
 
 int main(int argc, char *argv[])
 {
-#if 0
-	RTP_Init();
-	RtspClient	*client = malloc( sizeof( RtspClient ));
-	memset( client, 0, sizeof( RtspClient ));
-	strcpy( client->rtsp_url,  DEF_RTSP_URL );
-	client->maxBufSize = 1024*1024;
-	client->recv_buf = malloc(client->maxBufSize);
-	if( !client->recv_buf )
-	{
-		printf("malloc error!\r\n");
-		return;
-	}
-	rtsp_work_thread( (void *)client );
-#endif
-
-#if 1
-	// 使用RTSP形式发送数据
-	RTP_Init();
-	HISystem_Start();
-	HANDLE *vdec = Hi264DecCreate( NULL );
-	if( vdec == NULL )
-	{
-		printf("create vdec error!\r\n");
-		return;
-	}
-	Hi264Init( vdec );
 	RtspClient *client;
 	if( argc == 2 )
 		client = RTSP_New( argv[1], 0, NULL, NULL );
 	else
 		client = RTSP_New( URL, 0, NULL, NULL );
-	
-		
-		
-	client->Vdec = vdec;
 	if( !client->recv_buf )
 	{
 		printf("malloc error!\r\n");
 		return;
 	}
 	rtsp_work_thread( (void *)client );
-#endif
-
-#if 0
-	//  直接获取码流数据
-	HISystem_Start();
-	HANDLE *vdec = Hi264DecCreate( NULL );
-	if( vdec == NULL )
-	{
-		printf("create vdec error!\r\n");
-		return;
-	}
-	Hi264Init( vdec );
-	H264DEC_Init( "192.168.1.92", 0, vdec );
-	while( 1 )
-		usleep( 10000 );
-#endif
-
-#if 0
-	// 使用TCP数据流
-	HISystem_Start();
-	FilterInit();
-	HANDLE *vdec = Hi264DecCreate( NULL );
-	if( vdec == NULL )
-	{
-		printf("create vdec error!\r\n");
-		return;
-	}
-	Hi264Init( vdec );
-	HANDLE *nf = NewFilter( 1024*1024 , vdec );
-	if( nf == NULL )
-	{
-		printf("create Filter error!\r\n");
-		return;
-	}
-	H264DEC_Init( "192.168.1.92", 0 , nf);
-	while( 1 )
-		usleep( 10000 );
-
-#endif
-
 }
