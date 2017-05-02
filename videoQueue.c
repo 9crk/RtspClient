@@ -29,7 +29,7 @@
 
 typedef struct tagMediaQueue
 {
-	_longtime time_stamp;	//
+	// _longtime time_stamp;	//
 	void *video;
 	int size;
 }MediaQuequ_S;

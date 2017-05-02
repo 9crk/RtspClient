@@ -4,6 +4,7 @@
  *       Filename:  rtpc.c
  *
  *    Description:  this file is used to get a rtp package
+ *     stand by url:  http://blog.csdn.net/chen495810242/article/details/39207305
  *
  *        Version:  1.0
  *        Created:  2017-03-15 09:44:10 PM
@@ -36,6 +37,9 @@
 #include <linux/sockios.h>
 #include <netinet/in.h> 
 #include <arpa/inet.h> 
+// 500K 应该够了
+#define MAX_RTP_BUFFER 1024*1000
+typedef void * HANDLE;
 #define __PACKED__        __attribute__ ((__packed__)) 
 // 小端格式代码
 typedef unsigned int HI_U32; 
@@ -111,17 +115,27 @@ struct _AU_HEADER
 } __PACKED__; /**//* 1 BYTES */
 typedef struct _AU_HEADER AU_HEADER;
 
+typedef enum tagNALU_E{
+	NALU_SIGNEL,	// 单片包, 标准的NALU包
+	NALU_MUTIL,		// 聚合包	// 一个包里有多个分片内容
+	NALU_SLICE		// 分片包	// 多个小包拼接成大包
+}NALU_E;
+
 #define SLICE_NORMAL	0	// 常规单包
 #define SLICE_START 1		// 多包开始
 #define SLICE_MID	2		// 多包中包
 #define SLICE_END	3		// 多包尾包
 
+#define MAGIC_NUM	0xabcd1234
+#define RTP_INVALID( obj ) ( obj->magic != MAGIC_NUM )
+
 typedef struct RTP_PACK
 {
+	unsigned int magic;
 	// 包序，没啥用
 	int PreSeq;
 	// 存放每次收到的RTP包
-	char *rpt_buf;
+	char *buf;
 	// 每次收到RTP包的时候都会计入offset偏移值里
 	int offset;
 	// 可以发送出去的帧buf
@@ -129,6 +143,8 @@ typedef struct RTP_PACK
 	// 帧的长度，该frame里可能有多个小的帧信息
 	int frame_offset;
 	int size;
+	// 本地包是否已经满了，满了的话在次进入时要重设偏移位置
+	int hasFull;
 	//这次收到的包类型
 	char type;
 	HI_U32 timestamp;	// 每个包的timestamp，没啥用
@@ -148,96 +164,101 @@ static int  AppendData( char *dst, int offset, char *buf, int size )
 	return size;
 }
 
-static RTP_PACK_S  MyRTP;
-
-int RTP_Init()
+HANDLE RTP_Init()
 {
-	memset( &MyRTP, 0, sizeof( RTP_PACK_S ));
-	MyRTP.rpt_buf = malloc( 1024*1024 );
-	MyRTP.frame = malloc( 1024*1024 );
+	RTP_PACK_S *obj = malloc( sizeof( RTP_PACK_S ));
+	memset( obj, 0, sizeof( RTP_PACK_S ));
+	obj->magic = MAGIC_NUM;
+	obj->buf = malloc( MAX_RTP_BUFFER );	// 网络包小于1500
+	obj->frame = malloc( MAX_RTP_BUFFER );	// 整包小于500K
+	return obj;
 }
 
-int RTP_Exit()
+int RTP_Exit( HANDLE handle)
 {
-	if( MyRTP.rpt_buf )
-		free( MyRTP.rpt_buf );
-}
-
-typedef void * HANDLE;
-
-int SaveAs()
-{
-	static int fd = 0;
-	if( fd == 0 )
+	RTP_PACK_S *obj = (RTP_PACK_S*)handle;
+	if( RTP_INVALID( obj ) )
 	{
-		fd = open( "test0.264", O_RDWR | O_CREAT);
-		if( fd < 0 )
-		{ 
-			fd = 0;
-			return;
-		}
+		printf("invalid obj !\r\n");
+		return -1;
 	}
-	printf("Dump into file len:%d hex:%s \r\n", MyRTP.offset, show_hex( MyRTP.rpt_buf, 20 ));
-	write( fd , MyRTP.frame, MyRTP.frame_offset );
-	MyRTP.frame_offset = 0;
+	free( obj->buf );
+	if( obj->frame );
+		free( obj->frame );
 }
 
-int RTP_Send(HANDLE Vde)
+int RTP_Send( HANDLE handle,HANDLE Vde)
 {
-	usleep( 10000 );
+	RTP_PACK_S *obj = (RTP_PACK_S*)handle;
+	if( RTP_INVALID( obj ) )
+	{
+		printf("invlaid obj!\r\n");
+		return -1;
+	}
 	if( Vde )
-		Hi264DecFrame( Vde, MyRTP.frame, MyRTP.frame_offset, 0, NULL , 0 );
-	MyRTP.frame_offset = 0;
+	{
+		printf("Send Hex:%s \r\n", show_hex( obj->frame, 20 ));
+		// you should add handle code here
+//		Hi264DecFrame( Vde, obj->frame, obj->frame_offset, 0, NULL , 0 );
+	}
+	obj->frame_offset = 0;
 }
 
-typedef enum tagNALU_E{
-	NALU_SIGNEL,	// 单片包, 标准的NALU包
-	NALU_MUTIL,		// 聚合包	// 一个包里有多个分片内容
-	NALU_SLICE		// 分片包	// 多个小包拼接成大包
-}NALU_E;
-
-static int Append_frame( char type )
+static int Append_frame( RTP_PACK_S *obj,char type )
 {
 	if( type == 0x61 || type == 0x65 || type == 0x06)
 	{
 		// I帧或BP帧
-		memcpy( MyRTP.frame + MyRTP.frame_offset, MyRTP.rpt_buf, MyRTP.offset );
-		MyRTP.frame_offset += MyRTP.offset;
+		if( (obj->frame_offset + obj->offset ) > MAX_RTP_BUFFER )
+		{
+			printf("包已经超过了大小，抛弃该包!请设置最大包大小\r\n");
+			obj->hasFull = 1;
+			return 0;
+		}
+		memcpy( obj->frame + obj->frame_offset, obj->buf, obj->offset );
+		obj->frame_offset += obj->offset;
+		obj->hasFull = 1;
 		return 1;
 	}
 	//帧头,不做发送处理，等待后续的数据帧
-	memcpy( MyRTP.frame + MyRTP.frame_offset , MyRTP.rpt_buf, MyRTP.offset );
-	MyRTP.frame_offset += MyRTP.offset;
+	memcpy( obj->frame + obj->frame_offset , obj->buf, obj->offset );
+	obj->frame_offset += obj->offset;
 	return 0;
 }
 
-// -1 Error
-// 1 keep receive package
-// 0 ok to Write
-int ParseRtp(  char *Buffer, int BufferSize )
+int ParseRtp(  HANDLE handle , char *Buffer, int BufferSize )
 {
 	if( BufferSize < sizeof( RTP_FIXED_HEADER ))
 	{	
 		printf("Package too small!\r\n");
 		return -1;
 	}
-	int seq;
+	RTP_PACK_S *rtp_pack = (RTP_PACK_S*)handle;
+	if( RTP_INVALID( rtp_pack ))
+	{
+		printf("rtp obj invalid!\r\n");
+		return -1;
+	}
+	if( rtp_pack->hasFull )
+	{
+		rtp_pack->hasFull = 0;
+		rtp_pack->frame_offset = 0;
+		rtp_pack->offset = 0;
+	}
 	RTP_FIXED_HEADER    *rtp_hdr;
 	NALU_HEADER		*nalu_hdr;
 	FU_INDICATOR	*fu_ind;
 	FU_HEADER		*fu_hdr;
 	char *packBuf;
 	unsigned char type;
-	RTP_PACK_S *rtp_pack = &MyRTP;
 	rtp_pack->size += BufferSize;
 	int SliceSta;
 	int offset = 12;
 	rtp_hdr = (RTP_FIXED_HEADER*)Buffer;
 	rtp_pack->timestamp = ntohl(rtp_hdr->timestamp);
-	seq = ntohs(rtp_hdr->seq_no);
+	rtp_pack->PreSeq = ntohs(rtp_hdr->seq_no);
 	NALU_E nalu_type = NALU_SIGNEL;
 	nalu_hdr = (NALU_HEADER*)(Buffer+12);
-	
 	if( nalu_hdr->TYPE <= 23 )
 		nalu_type = NALU_SIGNEL;
 	else if( 24 <= nalu_hdr->TYPE && nalu_hdr->TYPE <= 27 )
@@ -262,14 +283,14 @@ int ParseRtp(  char *Buffer, int BufferSize )
 			type  = (Buffer[12] & 0xe0)  | (Buffer[13] & 0x1f );
 			rtp_pack->type = type;
 			rtp_pack->offset = 0;
-			rtp_pack->offset = AddH264Head(rtp_pack->rpt_buf, type);
-			rtp_pack->offset += AppendData(rtp_pack->rpt_buf, rtp_pack->offset, Buffer + offset, BufferSize - offset);
+			rtp_pack->offset = AddH264Head(rtp_pack->buf, type);
+			rtp_pack->offset += AppendData(rtp_pack->buf, rtp_pack->offset, Buffer + offset, BufferSize - offset);
 		}else if( SliceSta == SLICE_MID ){
-			rtp_pack->offset += AppendData(rtp_pack->rpt_buf, rtp_pack->offset, Buffer + offset, BufferSize - offset);
+			rtp_pack->offset += AppendData(rtp_pack->buf, rtp_pack->offset, Buffer + offset, BufferSize - offset);
 		}else if( SliceSta == SLICE_END ) {
-			rtp_pack->offset += AppendData(rtp_pack->rpt_buf, rtp_pack->offset, Buffer + offset, BufferSize - offset);
+			rtp_pack->offset += AppendData(rtp_pack->buf, rtp_pack->offset, Buffer + offset, BufferSize - offset);
 			// 仅在最后一次完成帧结构的时候去组织该帧
-			return Append_frame( rtp_pack->type );
+			return Append_frame(rtp_pack, rtp_pack->type );
 		}else{
 			printf("UnKnow package!\r\n");
 		}
@@ -280,12 +301,13 @@ int ParseRtp(  char *Buffer, int BufferSize )
 		offset = 13;
 		type = Buffer[12] ;
 		rtp_pack->offset = 0;
-		rtp_pack->offset += AddH264Head(rtp_pack->rpt_buf, type );
-		rtp_pack->offset += AppendData(rtp_pack->rpt_buf,rtp_pack->offset, Buffer + offset, BufferSize - offset);
-		printf("Buffer Size:%d \r\n", rtp_pack->offset );
-		return Append_frame( type );
+		rtp_pack->offset += AddH264Head(rtp_pack->buf, type );
+		rtp_pack->offset += AppendData(rtp_pack->buf,rtp_pack->offset, Buffer + offset, BufferSize - offset);
+		// 对于单一的nalu帧，我们还无法判定是否该直接push到解码通道里，因为还不清楚I帧是否到来
+		return Append_frame( rtp_pack, type );
 	}else{
 		printf("unknow package !\r\n");
 	}
 	return 0;
 }
+
